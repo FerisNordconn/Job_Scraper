@@ -323,7 +323,7 @@ def scrape_jobs(search_term, location):
                 debug_log.append(f"[Indeed] {str(e)}")
 
         # -----------------------------------------------------------
-        # LINKEDIN
+        # LINKEDIN (robust selectors + fallbacks to ensure title/company/location)
         # -----------------------------------------------------------
 
         linkedin_url = (
@@ -333,79 +333,135 @@ def scrape_jobs(search_term, location):
 
         driver.get(linkedin_url)
 
-        time.sleep(5)
-
+        # wait for results list if present
         try:
-
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located(
-                    (
-                        By.CSS_SELECTOR,
-                        "ul.jobs-search__results-list li"
-                    )
+                    (By.CSS_SELECTOR, "ul.jobs-search__results-list li, .jobs-search-results__list li")
                 )
             )
+        except Exception:
+            pass
 
-            linkedin_cards = driver.find_elements(
-                By.CSS_SELECTOR,
-                "ul.jobs-search__results-list li"
-            )
+        time.sleep(2)
 
-            for card in linkedin_cards[:5]:
+        linkedin_cards = driver.find_elements(
+            By.CSS_SELECTOR,
+            "ul.jobs-search__results-list li, .jobs-search-results__list li, .job-card-container, .base-card"
+        )
 
+        for card in linkedin_cards[:5]:
+
+            try:
+                title = company = loc = link = ""
+
+                # Title - try multiple selectors then fallback to innerText
+                for sel in [
+                    ".base-search-card__title",
+                    ".job-search-card__title",
+                    ".job-card-list__title",
+                    ".result-card__title",
+                    "h3",
+                    "a"
+                ]:
+                    try:
+                        el = card.find_element(By.CSS_SELECTOR, sel)
+                        title = el.text.strip()
+                        if title:
+                            break
+                    except Exception:
+                        continue
+
+                # Location - try first so we can exclude it from heuristics later
+                for sel in [
+                    ".job-search-card__location",
+                    ".base-search-card__metadata > span",
+                    ".job-card-container__metadata-item",
+                    ".job-card__location",
+                    ".job-search-card__location"
+                ]:
+                    try:
+                        el = card.find_element(By.CSS_SELECTOR, sel)
+                        loc = el.text.strip()
+                        break
+                    except Exception:
+                        loc = location
+
+                # Company - try targeted selectors first
+                for sel in [
+                    ".base-search-card__subtitle",
+                    ".job-search-card__subtitle",
+                    ".result-card__subtitle",
+                    ".job-card-container__company-name",
+                    "h4"
+                ]:
+                    try:
+                        el = card.find_element(By.CSS_SELECTOR, sel)
+                        company = el.text.strip()
+                        if company:
+                            break
+                    except Exception:
+                        company = ""
+
+                # If still empty, try anchor that likely points to company page
+                if not company:
+                    try:
+                        a_company = card.find_element(By.CSS_SELECTOR, "a[href*='/company/'], a[href*='company-']")
+                        company = a_company.text.strip() or a_company.get_attribute("aria-label") or ""
+                    except Exception:
+                        company = ""
+
+                # Final heuristic: parse innerText and pick a sensible line
+                if not company:
+                    text = (card.get_attribute("innerText") or "").strip()
+                    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                    # remove title and location lines
+                    candidates = [ln for ln in lines if ln != title and ln != loc]
+                    for ln in candidates:
+                        low = ln.lower()
+                        if low in ("save", "easy apply", "apply on company site", "new"):
+                            continue
+                        company = ln
+                        break
+
+                # Link - prefer anchor href
                 try:
+                    a = card.find_element(By.CSS_SELECTOR, "a")
+                    link = a.get_attribute("href") or ""
+                except Exception:
+                    try:
+                        link = card.get_attribute("href") or ""
+                    except Exception:
+                        link = ""
 
-                    title_elem = card.find_element(
-                        By.CSS_SELECTOR,
-                        "h3.base-search-card__title"
-                    )
+                # final text fallback if title still empty
+                if not title:
+                    text = card.get_attribute("innerText") or ""
+                    title = text.split("\n")[0].strip()
 
-                    company_elem = card.find_element(
-                        By.CSS_SELECTOR,
-                        "h4.base-search-card__subtitle"
-                    )
+                jobs.append((
+                    title or "(no title)",
+                    company or "(no company)",
+                    loc or location,
+                    link or "",
+                    f"{search_term} in {location}"
+                ))
 
-                    location_elem = card.find_element(
-                        By.CSS_SELECTOR,
-                        ".job-search-card__location"
-                    )
+            except Exception as e:
+                try:
+                    debug_log.append(f"[LinkedIn Card] {str(e)}")
+                except Exception:
+                    pass
+                continue
 
-                    link_elem = card.find_element(
-                        By.TAG_NAME,
-                        "a"
-                    )
-
-                    title = title_elem.text.strip()
-                    company = company_elem.text.strip()
-                    loc = location_elem.text.strip()
-                    link = link_elem.get_attribute("href")
-
-                    jobs.append((
-                        title,
-                        company,
-                        loc,
-                        link,
-                        f"{search_term} in {location}"
-                    ))
-
-                except Exception as e:
-                    debug_log.append(
-                        f"[LinkedIn Card] {str(e)}"
-                    )
-
-        except Exception as e:
-            debug_log.append(
-                f"[LinkedIn Main] {str(e)}"
-            )
-
-        # -----------------------------------------------------------
+        # ----------------------------------------------------------------------------------------------------------
         # PROFESSION.HU
-        # -----------------------------------------------------------
+        # ----------------------------------------------------------------------------------------------------------
 
         profession_url = (
             f"https://www.profession.hu/allasok/"
-            f"{search_term.replace(' ', '-')}"
-            f"/{location.lower()}"
+            f"{search_term.replace(' ', '-')}/"
+            f"{location.lower()}"
         )
 
         driver.get(profession_url)
@@ -455,9 +511,9 @@ def scrape_jobs(search_term, location):
     return jobs, debug_log
 
 
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------------
 # ROUTES
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------------
 
 @app.route("/", methods=["GET", "POST"])
 def dashboard():
@@ -499,17 +555,13 @@ def dashboard():
                     )
 
                 else:
-                    return redirect(
-                        url_for("dashboard")
-                    )
+                    return redirect(url_for("dashboard"))
 
         elif "clear" in request.form:
 
             clear_all_jobs()
 
-            return redirect(
-                url_for("dashboard")
-            )
+            return redirect(url_for("dashboard"))
 
     jobs = get_all_jobs()
 
@@ -620,11 +672,9 @@ def dashboard():
         <p>Total jobs: <strong>
     """
 
-    html += str(len(jobs))
+    html += str(len(jobs)) + "</strong></p>"
 
     html += """
-        </strong></p>
-
         <table>
 
             <tr>
@@ -774,4 +824,3 @@ if __name__ == "__main__":
         port=5000,
         debug=True
     )
-    
