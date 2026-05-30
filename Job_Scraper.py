@@ -793,6 +793,13 @@ def scrape_jobs(search_term, location):
 
         # ------------------------------------------------------------------
         # PROFESSION.HU
+        #
+        # Live DOM structure (inspected May 2026):
+        #   Each job is an <li> inside a <ul> on the search results page.
+        #   - Title   : h2 > a[href*='/allas/']
+        #   - Company : a[href*='/allasok/']   ← company profile links
+        #   - Location: the <strong> element that follows the company link
+        #               (e.g. "Budapest IX.kerület")
         # ------------------------------------------------------------------
         profession_url = (
             "https://www.profession.hu/allasok?"
@@ -801,47 +808,30 @@ def scrape_jobs(search_term, location):
 
         driver.get(profession_url)
 
-        # Wait until cards appear
+        # Wait for at least one job link to appear
         try:
             WebDriverWait(driver, 15).until(
-                lambda d: len(
-                    d.find_elements(
-                        By.CSS_SELECTOR,
-                        "article, .job-card, .job-item, .search-result, "
-                        ".search-result-item, a[href*='/allas/']"
-                    )
-                ) > 3
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "a[href*='/allas/']")
+                )
             )
         except Exception as e:
             debug_log.append(f"[Profession Wait] {str(e)}")
 
-        # Profession.hu lazy-loads content
-        try:
-            driver.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight/2);"
-            )
-            time.sleep(2)
+        time.sleep(2)
 
-            driver.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight);"
-            )
-            time.sleep(2)
-        except Exception:
-            pass
-
+        # Each job lives in an <li> that contains a heading with an /allas/ link.
+        # We collect those <li> elements directly.
         prof_cards = driver.find_elements(
-            By.CSS_SELECTOR,
-            (
-                "article.job-card, "
-                "article.job-item, "
-                "div.job-card, "
-                "div.job-item, "
-                "li.job-item, "
-                ".search-result, "
-                ".search-result-item, "
-                "a[href*='/allas/']"
-            )
+            By.XPATH,
+            "//li[.//a[contains(@href,'/allas/')]]"
         )
+
+        # Fallback: if XPath finds nothing, grab raw job anchor elements
+        if not prof_cards:
+            prof_cards = driver.find_elements(
+                By.CSS_SELECTOR, "a[href*='/allas/']"
+            )
 
         debug_log.append(f"[Profession] Found {len(prof_cards)} cards")
 
@@ -849,198 +839,78 @@ def scrape_jobs(search_term, location):
 
         for card in prof_cards:
             try:
-                href = ""
-                card_text = clean_text(
-                    card.get_attribute("innerText") or ""
-                )
-
                 # ----------------------------------------------------------
-                # LINK
+                # LINK — the <a href="/allas/..."> inside the card
                 # ----------------------------------------------------------
-                if card.tag_name.lower() == "a":
+                if card.tag_name.lower() == "a" and "/allas/" in (card.get_attribute("href") or ""):
                     href = card.get_attribute("href") or ""
                 else:
                     try:
-                        a = card.find_element(
-                            By.CSS_SELECTOR,
-                            "a[href*='/allas/']"
-                        )
+                        a = card.find_element(By.CSS_SELECTOR, "a[href*='/allas/']")
                         href = a.get_attribute("href") or ""
+                    except Exception:
+                        continue
+
+                # Strip query-string session noise so dedup works properly
+                href_clean = href.split("?")[0]
+                if not href_clean or "/allas/" not in href_clean:
+                    continue
+                if href_clean in seen_links:
+                    continue
+
+                # ----------------------------------------------------------
+                # TITLE — text of the /allas/ anchor (lives inside h2)
+                # ----------------------------------------------------------
+                title = "(no title)"
+                try:
+                    title_el = card.find_element(By.CSS_SELECTOR, "a[href*='/allas/']")
+                    title = clean_text(title_el.text)
+                except Exception:
+                    pass
+
+                if not title or title == "(no title)":
+                    try:
+                        title = clean_text(card.find_element(By.CSS_SELECTOR, "h2, h3").text)
                     except Exception:
                         pass
 
-                if not href or "/allas" not in href:
-                    continue
-
-                if href in seen_links:
-                    continue
-
                 # ----------------------------------------------------------
-                # TITLE
-                # ----------------------------------------------------------
-                title = "(no title)"
-
-                title_selectors = [
-                    "h1",
-                    "h2",
-                    "h3",
-                    ".job-card__title",
-                    ".job-card-title",
-                    ".job-title",
-                    ".position",
-                    ".title",
-                    "a[href*='/allas/']"
-                ]
-
-                for sel in title_selectors:
-                    try:
-                        elements = card.find_elements(
-                            By.CSS_SELECTOR,
-                            sel
-                        )
-
-                        for el in elements:
-                            txt = clean_text(el.text)
-
-                            if (
-                                txt
-                                and len(txt) > 2
-                                and "jelentkez" not in txt.lower()
-                            ):
-                                title = txt
-                                break
-
-                        if title != "(no title)":
-                            break
-
-                    except Exception:
-                        continue
-
-                # fallback
-                if title == "(no title)" and card_text:
-                    lines = [
-                        ln.strip()
-                        for ln in card_text.splitlines()
-                        if ln.strip()
-                    ]
-
-                    if lines:
-                        title = lines[0]
-
-                # ----------------------------------------------------------
-                # COMPANY
+                # COMPANY — the /allasok/ anchor is the company profile link
+                # Example: <a href="/allasok/acme-kft/1,...">Acme Kft.</a>
                 # ----------------------------------------------------------
                 company = "(no company)"
-
-                company_selectors = [
-                    ".company-name",
-                    ".company",
-                    ".employer",
-                    ".job-card__company-name",
-                    ".job-card__company",
-                    ".job-card-company",
-                    ".company-link",
-                    ".job-ad-company",
-                    ".company-title",
-                    ".job-company",
-                    "a[href*='/ceg/']",
-                    "a[href*='/munkaado/']",
-                    "div[class*='company']",
-                    "span[class*='company']",
-                    "h3",
-                ]
-
-                for sel in company_selectors:
-                    try:
-                        elements = card.find_elements(
-                            By.CSS_SELECTOR,
-                            sel
-                        )
-
-                        for el in elements:
-                            txt = clean_text(el.text)
-
-                            if (
-                                txt
-                                and len(txt) > 1
-                                and txt.lower() != title.lower()
-                                and location.lower() not in txt.lower()
-                                and not re.search(
-                                    r"\d+\s*(ft|huf|eur|€)",
-                                    txt,
-                                    re.I
-                                )
-                            ):
-                                company = txt
-                                break
-
-                        if company != "(no company)":
-                            break
-
-                    except Exception:
-                        continue
-
-                # smart fallback
-                if company == "(no company)" and card_text:
-                    lines = [
-                        ln.strip()
-                        for ln in card_text.splitlines()
-                        if ln.strip()
-                    ]
-
-                    filtered = []
-
-                    for ln in lines:
-                        lower = ln.lower()
-
-                        if (
-                            lower == title.lower()
-                            or location.lower() in lower
-                            or re.search(r"\d+\s*(ft|huf|eur|€)", lower, re.I)
-                            or "jelentkez" in lower
-                            or "állás" in lower
-                            or "munka" in lower
-                        ):
-                            continue
-
-                        filtered.append(ln)
-
-                    if filtered:
-                        company = filtered[0]
+                try:
+                    company_el = card.find_element(By.CSS_SELECTOR, "a[href*='/allasok/']")
+                    raw = clean_text(company_el.text)
+                    # Trim trailing rating digits like "Amplifon Group 3,8"
+                    raw = re.sub(r"\s+\d+[,\.]\d+\s*$", "", raw).strip()
+                    if raw:
+                        company = raw
+                except Exception:
+                    pass
 
                 # ----------------------------------------------------------
-                # LOCATION
+                # LOCATION — bold text in the card's metadata list
+                # profession.hu wraps location in <strong> after the company
                 # ----------------------------------------------------------
                 loc = location
-
-                location_selectors = [
-                    ".job-card__location",
-                    ".location",
-                    ".job-location",
-                    ".job-card__info-item--location",
-                    "span[class*='location']",
-                    "div[class*='location']",
-                ]
-
-                for sel in location_selectors:
-                    try:
-                        elements = card.find_elements(
-                            By.CSS_SELECTOR,
-                            sel
-                        )
-
-                        for el in elements:
-                            txt = clean_text(el.text)
-
-                            if txt:
-                                loc = txt
-                                break
-
-                        if loc != location:
+                try:
+                    # Prefer a <strong> whose text looks like a place name
+                    strongs = card.find_elements(By.CSS_SELECTOR, "strong, b")
+                    for s in strongs:
+                        txt = clean_text(s.text)
+                        # Location strings are short, don't contain salary markers
+                        if (
+                            txt
+                            and len(txt) <= 60
+                            and not re.search(r"\d+\s*(ft|huf|eur|€|000)", txt, re.I)
+                            and txt.lower() != company.lower()
+                            and txt.lower() != title.lower()
+                        ):
+                            loc = txt
                             break
-
-                    except Exception:
-                        continue
+                except Exception:
+                    pass
 
                 jobs.append((
                     title,
@@ -1050,17 +920,23 @@ def scrape_jobs(search_term, location):
                     f"{search_term} in {location}"
                 ))
 
-                seen_links.add(href)
-
-                debug_log.append(
-                    f"[Profession OK] {title} | {company} | {href}"
-                )
+                seen_links.add(href_clean)
+                debug_log.append(f"[Profession OK] {title!r} | {company!r} | {loc!r}")
 
                 if len(seen_links) >= 5:
                     break
 
             except Exception as e:
                 debug_log.append(f"[Profession Card] {str(e)}")
+
+        # close the try block for scrape_jobs: ensure driver is quit and return results
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    return jobs, debug_log
 
 
 # -------------------------------------------------------------------
